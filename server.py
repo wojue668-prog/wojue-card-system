@@ -1,190 +1,91 @@
 """
-极简自动发卡系统 - 数据库版
-- 使用 PostgreSQL 数据库（Render 免费提供）
+极简自动发卡系统
+- 单文件，零依赖（除Flask）
 - 付款后自动返回激活码
 - 支持微信/支付宝收款码
 """
-import json, os, csv, uuid, time, random, string, base64, hashlib
+import json, os, csv, uuid, time, hashlib
 from datetime import datetime
-from flask import Flask, render_template_string, request, jsonify, send_file
-import psycopg2
-from psycopg2.extras import DictCursor
 
 # ============ 配置区 ============
 CONFIG = {
     "product_name": "navos 激活码",
+    "price": "29.9",
     "tiers": {
         "3D": {"name": "3天体验", "price": "5.8"},
         "7D": {"name": "7天", "price": "13.8"},
         "30D": {"name": "30天", "price": "25.8"},
     },
-    "contact_qq": "",
-    "contact_wx": "wojueaispace",
+    # 收款码图片路径（放在 static/ 目录下）
+    "wechat_qr": "static/wechat.jpg",
+    "alipay_qr": "static/alipay.jpg",
+    # 联系方式（付款后显示）
+    "contact_qq": "你的QQ号",
+    "contact_wx": "你的微信号",
 }
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(BASE_DIR, "cards.json")
+ORDERS_FILE = os.path.join(BASE_DIR, "orders.json")
 
-# ============ 数据库配置 ============
-DATABASE_URL = os.environ.get('DATABASE_URL')
-PRIVATE_KEY_PEM = os.environ.get('PRIVATE_KEY', '')
+def load_cards():
+    """加载所有激活码到内存"""
+    if not os.path.exists(DATA_FILE):
+        return []
+    with open(DATA_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-def get_db():
-    """获取数据库连接"""
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+def save_cards(cards):
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cards, f, ensure_ascii=False, indent=2)
 
-def init_db():
-    """初始化数据库表"""
-    conn = get_db()
-    cur = conn.cursor()
-    # 激活码表
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS cards (
-            id SERIAL PRIMARY KEY,
-            code TEXT UNIQUE NOT NULL,
-            card_data TEXT NOT NULL,
-            tier TEXT NOT NULL,
-            used BOOLEAN DEFAULT FALSE,
-            order_id TEXT,
-            used_at TEXT
-        )
-    ''')
-    # 订单表
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY,
-            order_id TEXT UNIQUE,
-            tier TEXT,
-            card_code TEXT,
-            contact TEXT,
-            time TEXT
-        )
-    ''')
-    conn.commit()
-    cur.close()
-    conn.close()
+def load_orders():
+    if not os.path.exists(ORDERS_FILE):
+        return []
+    with open(ORDERS_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-def import_csv_to_db(csv_path):
-    """从 CSV 导入激活码到数据库"""
-    conn = get_db()
-    cur = conn.cursor()
-    count = 0
+def save_orders(orders):
+    with open(ORDERS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(orders, f, ensure_ascii=False, indent=2)
+
+def import_csv(csv_path):
+    """从 gen_code.py 生成的 CSV 导入激活码"""
+    cards = load_cards()
     with open(csv_path, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            code = row["卡号"]
-            card_data = row["卡密"]
-            tier = code.split("-")[1] if "-" in code else "30D"
-            try:
-                cur.execute(
-                    "INSERT INTO cards (code, card_data, tier, used) VALUES (%s, %s, %s, %s)",
-                    (code, card_data, tier, False)
-                )
-                count += 1
-            except psycopg2.IntegrityError:
-                pass  # 已存在，跳过
-    conn.commit()
-    cur.close()
-    conn.close()
-    return count
+            cards.append({
+                "code": row["卡号"],
+                "card_data": row["卡密"],
+                "tier": row["卡号"].split("-")[1] if "-" in row["卡号"] else "30D",
+                "used": False,
+                "order_id": None,
+                "used_at": None,
+            })
+    save_cards(cards)
+    return len(cards)
 
-def get_card_from_db(tier):
+def get_card(tier):
     """获取一张未使用的激活码"""
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute(
-        "SELECT * FROM cards WHERE tier = %s AND used = FALSE LIMIT 1",
-        (tier,)
-    )
-    card = cur.fetchone()
-    cur.close()
-    conn.close()
-    return dict(card) if card else None
+    cards = load_cards()
+    for card in cards:
+        if not card["used"] and card["tier"] == tier:
+            return card
+    return None
 
-def mark_used_in_db(card_code, order_id):
-    """标记激活码为已使用"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE cards SET used = TRUE, order_id = %s, used_at = %s WHERE code = %s",
-        (order_id, datetime.now().isoformat(), card_code)
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def load_cards_from_db():
-    """加载所有激活码"""
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute("SELECT * FROM cards")
-    cards = [dict(c) for c in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return cards
-
-def load_orders_from_db():
-    """加载所有订单"""
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute("SELECT * FROM orders ORDER BY id DESC")
-    orders = [dict(o) for o in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return orders
-
-def save_order_to_db(order_id, tier, card_code, contact):
-    """保存订单"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO orders (order_id, tier, card_code, contact, time) VALUES (%s, %s, %s, %s, %s)",
-        (order_id, tier, card_code, contact, datetime.now().isoformat())
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-
-# ============ 激活码生成 ============
-def generate_code_str(tier):
-    """生成一个激活码字符串（不含签名数据）"""
-    chars = string.ascii_uppercase + string.digits
-    seg1 = ''.join(random.choice(chars) for _ in range(4))
-    seg2 = ''.join(random.choice(chars) for _ in range(4))
-    seg3 = ''.join(random.choice(chars) for _ in range(4))
-    return f"WJ-{tier}-{seg1}-{seg2}-{seg3}"
-
-def generate_and_sign_code(tier):
-    """生成激活码并签名，返回 (code, card_data)"""
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding
-
-    code = generate_code_str(tier)
-    # 卡密 = 签名后的数据（Base64编码）
-    private_key = serialization.load_pem_private_key(PRIVATE_KEY_PEM.encode(), password=None)
-    signature = private_key.sign(code.encode(), padding.PKCS1v15(), hashes.SHA256())
-    card_data = base64.b64encode(signature).decode('ascii')
-    return code, card_data
-
-def batch_generate_to_db(tier, count):
-    """批量生成激活码并写入数据库"""
-    conn = get_db()
-    cur = conn.cursor()
-    added = 0
-    for _ in range(count):
-        try:
-            code, card_data = generate_and_sign_code(tier)
-            cur.execute(
-                "INSERT INTO cards (code, card_data, tier, used) VALUES (%s, %s, %s, %s)",
-                (code, card_data, tier, False)
-            )
-            added += 1
-        except psycopg2.IntegrityError:
-            continue  # 极低概率重复，重试下一个
-    conn.commit()
-    cur.close()
-    conn.close()
-    return added
+def mark_used(card_id, order_id):
+    cards = load_cards()
+    for c in cards:
+        if c["code"] == card_id:
+            c["used"] = True
+            c["order_id"] = order_id
+            c["used_at"] = datetime.now().isoformat()
+            break
+    save_cards(cards)
 
 # ============ Flask 路由 ============
+from flask import Flask, render_template_string, request, jsonify, send_file
+
 app = Flask(__name__)
 
 HTML_PAGE = r'''<!DOCTYPE html>
@@ -194,11 +95,11 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{ config.product_name }} - 购买激活码</title>
 <style>
-* { margin:0; padding:0; box-sizing: border-box; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, 'Microsoft YaHei', sans-serif;
        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
        min-height: 100vh; color: #fff; }
-.container { max-width: 800px; margin:0 auto; padding: 20px; }
+.container { max-width: 800px; margin: 0 auto; padding: 20px; }
 .header { text-align: center; padding: 40px 20px; }
 .header h1 { font-size: 28px; background: linear-gradient(90deg, #e94560, #f5a623);
              -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
@@ -236,7 +137,7 @@ body { font-family: -apple-system, 'Microsoft YaHei', sans-serif;
 .pay-warning strong { color: #fff; }
 
 .order-section { margin-top: 30px; }
-.input-group { max-width: 400px; margin:0 auto 20px; }
+.input-group { max-width: 400px; margin: 0 auto 20px; }
 .input-group input { width: 100%; padding: 12px 16px; border: 1px solid rgba(255,255,255,0.2);
                     border-radius: 8px; background: rgba(255,255,255,0.05); color: #fff;
                     font-size: 14px; outline: none; transition: border-color 0.3s; }
@@ -312,7 +213,7 @@ body { font-family: -apple-system, 'Microsoft YaHei', sans-serif;
   </div>
 
   <div class="contact">
-    如有问题请联系微信：<b>{{ config.contact_wx }}</b>
+    如有问题请联系 QQ：{{ config.contact_qq }} | 微信：{{ config.contact_wx }}
   </div>
 
   <div class="footer">Powered by 离线激活系统</div>
@@ -333,6 +234,7 @@ function selectTier(el) {
   document.querySelectorAll('.tier-card').forEach(c => c.classList.remove('selected'));
   el.classList.add('selected');
   selectedTier = el.dataset.tier;
+  // 切换收款码和金额
   const qr = QR_MAP[selectedTier];
   document.getElementById('alipayQr').src = qr.alipay;
   document.getElementById('payAmount').textContent = qr.price;
@@ -341,8 +243,10 @@ function selectTier(el) {
 async function confirmPay() {
   const btn = document.getElementById('buyBtn');
   const contact = document.getElementById('buyerContact').value.trim();
-
-  if (!contact) { alert('请填写联系方式'); return; }
+  
+  if (!contact) {
+    alert('请填写联系方式'); return;
+  }
 
   btn.disabled = true;
   btn.textContent = '正在处理...';
@@ -376,6 +280,7 @@ function copyCode() {
   navigator.clipboard.writeText(code).then(() => {
     alert('已复制！请粘贴到工具的激活对话框中');
   }).catch(() => {
+    // fallback
     const ta = document.createElement('textarea');
     ta.value = code; document.body.appendChild(ta);
     ta.select(); document.execCommand('copy');
@@ -397,13 +302,23 @@ def api_buy():
     tier = data.get('tier', '30D')
     contact = data.get('contact', '')
 
-    card = get_card_from_db(tier)
+    card = get_card(tier)
     if not card:
         return jsonify({"ok": False, "error": f"{tier} 档位库存不足，请稍后尝试或联系客服"})
 
     order_id = str(uuid.uuid4())[:8].upper()
-    mark_used_in_db(card['code'], order_id)
-    save_order_to_db(order_id, tier, card['code'], contact)
+    mark_used(card['code'], order_id)
+
+    # 记录订单
+    orders = load_orders()
+    orders.append({
+        "order_id": order_id,
+        "tier": tier,
+        "card_code": card['code'],
+        "contact": contact,
+        "time": datetime.now().isoformat(),
+    })
+    save_orders(orders)
 
     return jsonify({
         "ok": True,
@@ -414,18 +329,19 @@ def api_buy():
 
 @app.route('/admin')
 def admin():
-    cards = load_cards_from_db()
-    orders = load_orders_from_db()
-
+    """管理面板：查看库存和订单"""
+    cards = load_cards()
+    orders = load_orders()
+    
     total = len(cards)
     used = sum(1 for c in cards if c['used'])
     available = total - used
-
+    
     by_tier = {}
     for t in CONFIG['tiers']:
         tc = [c for c in cards if c['tier'] == t]
         by_tier[t] = {"total": len(tc), "available": sum(1 for c in tc if not c['used'])}
-
+    
     html = f'''
     <!DOCTYPE html><html><head><meta charset="UTF-8"><title>管理面板</title>
     <style>
@@ -444,7 +360,7 @@ def admin():
       <div class="stat"><h3 style=color:#00ff88>{available}</h3><p>可用</p></div>
       <div class="stat"><h3 style=color:#f5a623>{used}</h3><p>已售</p></div>
     </div>
-
+    
     <h2>各档位库存</h2>
     <table><tr><th>档位</th><th>总库存</th><th>可用</th><th>已售</th></tr>
     '''
@@ -452,36 +368,27 @@ def admin():
         name = CONFIG['tiers'][t]['name']
         sold = info['total'] - info['available']
         html += f'<tr><td>{t} ({name})</td><td>{info["total"]}</td><td style=color:#00ff88>{info["available"]}</td><td>{sold}</td></tr>'
-    html += '</table><br>'
-    html += f'''
-    <div style="margin:20px 0;">
-      <a href="/admin/generate" style="display:inline-block;padding:14px 30px;
-         background:linear-gradient(90deg,#e94560,#f5a623);color:#fff;border-radius:8px;
-         text-decoration:none;font-weight:bold;font-size:16px;">⚡ 一键生成激活码</a>
-      <span style="margin-left:20px;">
-        <a href="/admin/import" style="color:#888;text-decoration:none;">或导入CSV</a>
-      </span>
-    </div>'''
-
+    html += '</table>'
+    
     html += f'''
     <h2 style="margin-top:30px">最近订单 ({len(orders)})</h2>
     <table><tr><th>时间</th><th>订单号</th><th>档位</th><th>激活码</th><th>联系</th></tr>
     '''
-    for o in orders[:50]:
+    for o in reversed(orders[-20:]):
         html += f'<tr><td>{o["time"][:16]}</td><td>{o["order_id"]}</td><td>{o["tier"]}</td><td>{o["card_code"]}</td><td>{o["contact"]}</td></tr>'
     html += '</table><br><a href="/">← 返回首页</a></body></html>'
     return html
 
 @app.route('/admin/import', methods=['GET', 'POST'])
 def admin_import():
+    """导入CSV"""
     if request.method == 'POST':
         if 'file' in request.files:
             f = request.files['file']
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp:
-                f.save(tmp.name)
-                count = import_csv_to_db(tmp.name)
-                os.unlink(tmp.name)
+            path = os.path.join(BASE_DIR, '_upload_' + f.filename)
+            f.save(path)
+            count = import_csv(path)
+            os.remove(path)
             return f'导入成功！共 {count} 个激活码<br><a href="/admin">返回管理面板</a>'
         return '没有上传文件'
     return '''
@@ -489,94 +396,27 @@ def admin_import():
     <style>body{font-family:sans-serif;background:#1a1a2e;color:#fff;padding:20px;}</style></head>
     <body>
     <h1>导入激活码 CSV</h1>
-    <p>CSV格式：第一列"卡号"，第二列"卡密"</p>
     <form method="post" enctype="multipart/form-data">
       <input type="file" name="file" accept=".csv"><br><br>
       <button>导入</button>
-    </form>
-    <br><br>
-    <h2>⚡ 一键生成激活码（推荐）</h2>
-    <form action="/api/generate" method="get">
-      <label>档位：
-        <select name="tier">
-          <option value="3D">3天体验</option>
-          <option value="7D">7天</option>
-          <option value="30D">30天</option>
-        </select>
-      </label><br><br>
-      <label>数量：<input type="number" name="count" value="100" min="1" max="500"></label><br><br>
-      <button type="submit" style="padding:10px 30px;background:#e94560;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:16px;">🚀 生成并入库</button>
-    </form>
-    <br><a href="/admin">← 返回管理面板</a>
-    </body></html>'''
-
-@app.route('/admin/generate', methods=['GET', 'POST'])
-def admin_generate():
-    """一键生成激活码页面"""
-    if request.method == 'POST' or (request.method == 'GET' and request.args.get('tier')):
-        tier = request.form.get('tier') or request.args.get('tier', '30D')
-        count = int(request.form.get('count') or request.args.get('count', '100'))
-        count = min(count, 500)  # 单次最多500个
-        added = batch_generate_to_db(tier, count)
-        return f'''
-        <!DOCTYPE html><html><head><meta charset="UTF-8"><title>生成完成</title>
-        <style>body{{font-family:sans-serif;background:#1a1a2e;color:#fff;padding:20px;text-align:center;}}
-        .ok{{color:#00ff88;font-size:48px;margin:30px 0;}}</style></head>
-        <body>
-        <div class="ok">✅</div>
-        <h1>生成成功！</h1>
-        <p style="font-size:20px;margin:20px 0;">已为 <b>{CONFIG[tier]["name"]}</b> 档位生成 <b style=color:#e94560>{added}</b> 个激活码</p>
-        <br><br>
-        <a href="/admin" style="color:#4da6ff;font-size:18px;">← 返回管理面板查看库存</a>
-        <br><br>
-        <a href="/admin/import" style="color:#888;">继续生成其他档位</a>
-        </body></html>'''
-
-    return '''
-    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>一键生成激活码</title>
-    <style>
-    body{font-family:sans-serif;background:#1a1a2e;color:#fff;padding:40px;}
-    h1{margin-bottom:30px;}
-    form{max-width:400px;background:rgba(255,255,255,0.05);border-radius:12px;padding:30px;}
-    label{display:block;margin-bottom:8px;font-size:14px;color:#aaa;}
-    select,input{width:100%;padding:10px;border:1px solid rgba(255,255,255,0.2);border-radius:6px;
-           background:rgba(255,255,255,0.05);color:#fff;font-size:16px;margin-bottom:15px;outline:none;}
-    button{width:100%;padding:14px;background:linear-gradient(90deg,#e94560,#f5a623);color:#fff;border:none;
-           border-radius:8px;font-size:18px;font-weight:bold;cursor:pointer;transition:transform 0.2s;}
-    button:hover{transform:scale(1.03);}
-    a{color:#4da6ff;display:block;margin-top:20px;}
-    .quick-btns{display:flex;gap:10px;margin-top:15px;}
-    .quick-btns a{flex:1;padding:10px;text-align:center;background:rgba(233,69,96,0.2);
-                   border-radius:6px;color:#fff;text-decoration:none;font-size:13px;}
-    .quick-btns a:hover{background:rgba(233,69,96,0.4);}
-    </style></head>
-    <body>
-    <h1>⚡ 一键生成激活码</h1>
-    <form method="post">
-      <label>选择档位</label>
-      <select name="tier">
-        <option value="3D">3天体验 (¥5.8)</option>
-        <option value="7D">7天 (¥13.8)</option>
-        <option value="30D" selected>30天 (¥25.8)</option>
-      </select>
-      <label>生成数量</label>
-      <input type="number" name="count" value="100" min="1" max="500">
-      <button type="submit">🚀 立即生成</button>
-    </form>
-    <div class="quick-btns">
-      <a href="?tier=3D&count=100">3天×100</a>
-      <a href="?tier=7D&count=100">7天×100</a>
-      <a href="?tier=30D&count=87">30天补到100</a>
-    </div>
-    <a href="/admin">← 返回管理面板</a>
+    </form><br><a href="/admin">← 返回管理面板</a>
     </body></html>'''
 
 if __name__ == '__main__':
-    init_db()
-    os.makedirs(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static'), exist_ok=True)
+    # 初始化数据
+    if not os.path.exists(DATA_FILE):
+        save_cards([])
+    if not os.path.exists(ORDERS_FILE):
+        save_orders([])
+    
+    # 创建 static 目录存放收款码
+    os.makedirs(os.path.join(BASE_DIR, 'static'), exist_ok=True)
+    
+    # 支持云部署：从环境变量读取端口，默认5000
     port = int(os.environ.get('PORT', 5000))
+    
     print("=" * 50)
-    print("   极简发卡系统（数据库版）已启动")
+    print("   极简发卡系统已启动")
     print(f"   首页: http://localhost:{port}")
     print(f"   管理: http://localhost:{port}/admin")
     print(f"   导入: http://localhost:{port}/admin/import")
