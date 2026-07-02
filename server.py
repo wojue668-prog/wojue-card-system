@@ -18,8 +18,8 @@ CONFIG = {
         "7D": {"name": "7天", "price": "13.8"},
         "30D": {"name": "30天", "price": "25.8"},
     },
-    "contact_qq": "你的QQ号",
-    "contact_wx": "你的微信号",
+    "contact_qq": "",
+    "contact_wx": "wojueaispace",
 }
 
 # ============ 数据库配置 ============
@@ -312,7 +312,7 @@ body { font-family: -apple-system, 'Microsoft YaHei', sans-serif;
   </div>
 
   <div class="contact">
-    如有问题请联系 QQ：{{ config.contact_qq }} | 微信：{{ config.contact_wx }}
+    如有问题请联系微信：<b>{{ config.contact_wx }}</b>
   </div>
 
   <div class="footer">Powered by 离线激活系统</div>
