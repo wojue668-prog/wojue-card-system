@@ -3,8 +3,9 @@
 - 单文件，零依赖（除Flask）
 - 付款后自动返回激活码
 - 支持微信/支付宝收款码
+- 管理面板支持一键生成激活码
 """
-import json, os, csv, uuid, time, hashlib
+import json, os, csv, uuid, time, hashlib, base64
 from datetime import datetime
 
 # ============ 配置区 ============
@@ -20,8 +21,8 @@ CONFIG = {
     "wechat_qr": "static/wechat.jpg",
     "alipay_qr": "static/alipay.jpg",
     # 联系方式（付款后显示）
-    "contact_qq": "你的QQ号",
-    "contact_wx": "你的微信号",
+    "contact_qq": "",
+    "contact_wx": "wojueaispace",
 }
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "cards.json")
@@ -83,7 +84,66 @@ def mark_used(card_id, order_id):
             break
     save_cards(cards)
 
-# ============ Flask 路由 ============
+# ============ 激活码生成（内嵌，不依赖外部文件）============
+def _make_code(prefix="WJ"):
+    """生成随机激活码格式: PREFIX-XX-XXXX-XXXX-XXXX"""
+    import secrets
+    seg = lambda n: ''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(n))
+    return f"{prefix}-{seg(2)}-{seg(4)}-{seg(4)}-{seg(4)}"
+
+def _sign_data(data_str):
+    """用私钥签名数据，返回 base64 编码的签名"""
+    private_key_pem = os.environ.get('PRIVATE_KEY', '')
+    if not private_key_pem:
+        # 降级：没有私钥时返回简单哈希签名（仅用于测试）
+        return hashlib.sha256(data_str.encode()).hexdigest()[:32]
+
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        private_key = serialization.load_pem_private_key(
+            private_key_pem.encode(), password=None
+        )
+        signature = private_key.sign(
+            data_str.encode(),
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
+        return base64.b64encode(signature).decode()
+    except Exception as e:
+        print(f"签名失败(降级为hash): {e}")
+        return hashlib.sha256(data_str.encode()).hexdigest()[:32]
+
+def generate_cards(tier, count=10):
+    """生成指定数量激活码并写入 cards.json"""
+    prefix_map = {"3D": "WJ-3D", "7D": "WJ-7D", "30D": "WJ-30D"}
+    prefix = prefix_map.get(tier, "WJ-30D")
+    new_cards = []
+    for _ in range(count):
+        code = _make_code(prefix)
+        card_data = json.dumps({
+            "code": code,
+            "expire_days": int(tier.replace("D", "")) if tier != "3D" else 3,
+            "created_at": datetime.now().isoformat(),
+            "sig": _sign_data(code),
+        }, ensure_ascii=False)
+        new_cards.append({
+            "code": code,
+            "card_data": card_data,
+            "tier": tier,
+            "used": False,
+            "order_id": None,
+            "used_at": None,
+        })
+
+    # 写入现有库存
+    cards = load_cards()
+    cards.extend(new_cards)
+    save_cards(cards)
+    return len(new_cards)
+
+# ============ 数据操作函数 ============
 from flask import Flask, render_template_string, request, jsonify, send_file
 
 app = Flask(__name__)
@@ -327,38 +387,118 @@ def api_buy():
         "order_id": order_id,
     })
 
+@app.route('/api/generate', methods=['POST'])
+def api_generate():
+    """一键生成激活码"""
+    data = request.get_json() or {}
+    tier = data.get('tier', '30D')
+    count = int(data.get('count', 10))
+    count = max(1, min(count, 200))  # 限制 1-200 个
+
+    try:
+        added = generate_cards(tier, count)
+        return jsonify({"ok": True, "added": added, "tier": tier})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
 @app.route('/admin')
 def admin():
-    """管理面板：查看库存和订单"""
+    """管理面板：查看库存、生成激活码、导入CSV"""
     cards = load_cards()
     orders = load_orders()
-    
+
     total = len(cards)
     used = sum(1 for c in cards if c['used'])
     available = total - used
-    
+
     by_tier = {}
     for t in CONFIG['tiers']:
         tc = [c for c in cards if c['tier'] == t]
         by_tier[t] = {"total": len(tc), "available": sum(1 for c in tc if not c['used'])}
-    
-    html = f'''
-    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>管理面板</title>
+
+    # 生成档位选项
+    tier_options = ''.join(f'<option value="{t}">{t} - {info["name"]}</option>' for t, info in CONFIG['tiers'].items())
+
+    html = f'''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>管理面板</title>
     <style>
+      * {{ margin:0; padding:0; box-sizing:border-box; }}
       body {{ font-family:sans-serif; background:#1a1a2e; color:#fff; padding:20px; }}
-      .stats {{ display:flex; gap:20px; margin-bottom:20px; }}
-      .stat {{ background:rgba(255,255,255,0.05); padding:20px; border-radius:10px; min-width:120px; }}
-      .stat h3 {{ color:#e94560; font-size:28px; }}
-      table {{ width:100%; border-collapse:collapse; background:rgba(255,255,255,0.03); }}
-      th,td {{ padding:10px; text-align:left; border-bottom:1px solid rgba(255,255,255,0.1); font-size:13px; }}
-      th {{ color:#e94560; }}
-      a {{ color:#4da6ff; }}
+      h1 {{ margin-bottom:20px; }}
+      h2 {{ margin:25px 0 15px; color:#e94560; font-size:18px; }}
+      .stats {{ display:flex; gap:20px; margin-bottom:25px; flex-wrap:wrap; }}
+      .stat {{ background:rgba(255,255,255,0.05); padding:20px 30px; border-radius:10px; min-width:120px; text-align:center; }}
+      .stat h3 {{ color:#e94560; font-size:32px; margin-bottom:5px; }}
+      .stat p {{ color:#888; font-size:13px; }}
+
+      /* 操作区 */
+      .actions {{ background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:25px; margin:25px 0; }}
+      .action-row {{ display:flex; gap:15px; align-items:center; flex-wrap:wrap; margin-bottom:15px; }}
+      .action-row label {{ color:#aaa; font-size:14px; min-width:80px; }}
+      select, input[type=number] {{ padding:10px 14px; border:1px solid rgba(255,255,255,0.15); border-radius:8px;
+        background:rgba(255,255,255,0.05); color:#fff; font-size:14px; outline:none; }}
+      select:focus, input:focus {{ border-color:#e94560; }}
+      input[type=number]{{ width:100px; }}
+      .btn {{
+        padding:10px 24px; border:none; border-radius:8px; cursor:pointer; font-size:14px; font-weight:bold;
+        transition:all 0.2s; display:inline-flex; align-items:center; gap:6px;
+      }}
+      .btn-gen {{ background:linear-gradient(135deg,#e94560,#f5a623); color:#fff; }}
+      .btn-gen:hover {{ transform:translateY(-1px); box-shadow:0 4px 15px rgba(233,69,96,0.4); }}
+      .btn-import {{ background:linear-gradient(135deg,#4da6ff,#00d4aa); color:#fff; }}
+      .btn-import:hover {{ transform:translateY(-1px); box-shadow:0 4px 15px rgba(77,166,255,0.4); }}
+      .btn:disabled {{ opacity:0.5; cursor:not-allowed; transform:none !important; }}
+
+      /* 表格 */
+      table {{ width:100%; border-collapse:collapse; background:rgba(255,255,255,0.02); border-radius:10px; overflow:hidden; }}
+      th,td {{ padding:12px 16px; text-align:left; border-bottom:1px solid rgba(255,255,255,0.06); font-size:13px; }}
+      th {{ color:#e94560; background:rgba(233,69,96,0.08); font-weight:600; }}
+      tr:hover td {{ background:rgba(255,255,255,0.02); }}
+      a {{ color:#4da6ff; text-decoration:none; }}
+      a:hover {{ text-decoration:underline; }}
+
+      /* 结果提示 */
+      #genResult {{ padding:12px 16px; border-radius:8px; margin-top:12px; display:none; font-size:14px; }}
+      #genResult.success {{ display:block; background:rgba(0,255,136,0.08); border:1px solid rgba(0,255,136,0.3); color:#00ff88; }}
+      #genResult.error {{ display:block; background:rgba(233,69,96,0.08); border:1px solid rgba(233,69,96,0.3); color:#e94560; }}
+      .spinner {{ display:inline-block; width:14px;height:14px;border:2px solid rgba(255,255,255,0.3);
+                 border-top-color:#fff;border-radius:50%;animation:spin 0.6s linear infinite; }}
+      @keyframes spin {{ to{{ transform:rotate(360deg); }} }}
+
+      .nav-links {{ margin:20px 0; display:flex; gap:20px; }}
+      .nav-links a {{ color:#888; font-size:13px; }}
     </style></head><body>
     <h1>📊 发卡系统管理面板</h1>
+
     <div class="stats">
       <div class="stat"><h3>{total}</h3><p>总库存</p></div>
-      <div class="stat"><h3 style=color:#00ff88>{available}</h3><p>可用</p></div>
-      <div class="stat"><h3 style=color:#f5a623>{used}</h3><p>已售</p></div>
+      <div class="stat"><h3 style="color:#00ff88">{available}</h3><p>可用</p></div>
+      <div class="stat"><h3 style="color:#f5a623">{used}</h3><p>已售</p></div>
+    </div>
+
+    <!-- ===== 一键生成 ===== -->
+    <div class="actions">
+      <h2>🔧 一键生成激活码</h2>
+      <form id="genForm" onsubmit="return doGenerate(event)">
+        <div class="action-row">
+          <label>选择档位：</label>
+          <select id="genTier">{tier_options}</select>
+          <label style="margin-left:10px">数量：</label>
+          <input type="number" id="genCount" value="50" min="1" max="200">
+          <button type="submit" class="btn btn-gen" id="genBtn">⚡ 生成激活码</button>
+        </div>
+        <div id="genResult"></div>
+      </form>
+    </div>
+
+    <!-- ===== CSV导入 ===== -->
+    <div class="actions">
+      <h2>📁 导入 CSV 文件</h2>
+      <form action="/admin/import" method="post" enctype="multipart/form-data">
+        <div class="action-row">
+          <input type="file" name="file" accept=".csv" required style="max-width:300px;">
+          <button type="submit" class="btn btn-import">📥 上传导入</button>
+        </div>
+      </form>
     </div>
     
     <h2>各档位库存</h2>
@@ -375,8 +515,52 @@ def admin():
     <table><tr><th>时间</th><th>订单号</th><th>档位</th><th>激活码</th><th>联系</th></tr>
     '''
     for o in reversed(orders[-20:]):
-        html += f'<tr><td>{o["time"][:16]}</td><td>{o["order_id"]}</td><td>{o["tier"]}</td><td>{o["card_code"]}</td><td>{o["contact"]}</td></tr>'
-    html += '</table><br><a href="/">← 返回首页</a></body></html>'
+        html += f'<tr><td>{o["time"][:16]}</td><td>{o["order_id"]}</td><td>{o["tier"]}</td><td style="font-family:monospace;font-size:12px">{o["card_code"]}</td><td>{o["contact"]}</td></tr>'
+    html += '''</table>
+
+    <div class="nav-links" style="margin-top:30px">
+      <a href="/">← 返回首页</a>
+    </div>
+
+<script>
+function doGenerate(e) {
+  e.preventDefault();
+  const btn = document.getElementById('genBtn');
+  const result = document.getElementById('genResult');
+  const tier = document.getElementById('genTier').value;
+  const count = parseInt(document.getElementById('genCount').value) || 50;
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> 生成中...';
+  result.style.display = 'none';
+
+  fetch('/api/generate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({tier: tier, count: count})
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      result.className = 'success';
+      result.innerHTML = '✅ 成功生成 <strong>' + data.added + '</strong> 个 ' + tier + ' 激活码！<a href="/admin" style="margin-left:10px">刷新查看</a>';
+      // 3秒后刷新页面显示新库存
+      setTimeout(() => location.reload(), 2000);
+    } else {
+      result.className = 'error';
+      result.textContent = '❌ 生成失败: ' + (data.error || '未知错误');
+    }
+    btn.disabled = false;
+    btn.innerHTML = '⚡ 生成激活码';
+  })
+  .catch(err => {
+    result.className = 'error';
+    result.textContent = '❌ 网络错误: ' + err.message;
+    btn.disabled = false;
+    btn.innerHTML = '⚡ 生成激活码';
+  });
+}
+</script></body></html>'''
     return html
 
 @app.route('/admin/import', methods=['GET', 'POST'])
